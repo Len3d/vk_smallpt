@@ -1,0 +1,192 @@
+// oidn_conv_tiled.comp -- 3x3 convolution with padding 1, stride 1, optional fused ReLU,
+// using shared-memory tiling and register blocking.
+//
+// Same math as oidn_conv.comp, different work decomposition:
+//   - one work group covers a 16x16 block of output pixels and GROUP output channels
+//   - every thread computes a 2x2 pixel block for those GROUP channels (register blocking)
+//   - one input channel chunk (4 channels) is staged in shared memory (18x18 per channel),
+//     so the 3x3 neighbourhood of a pixel block is fetched once per chunk instead of per thread
+//
+// Channel-blocked layout: every tensor's channel stride is padded to a multiple of 4, so a
+// 4-channel chunk is one aligned 16-byte (FP32) / 8-byte (FP16) block and a single thread stages
+// it with one vec4 load instead of four scalar loads. Pixel p starts at p * channelStride, so
+// consecutive threads (which handle consecutive patch pixels) read consecutive chunks.
+// The FP32 buffers are declared as vec4, which makes that load exactly one 16-byte transaction;
+// the FP16 buffers stay scalar, because a 4-half vector is only 8 bytes and the conversion is
+// elementwise anyway.
+//
+// Load instructions per multiply-add: a chunk of 4 channels costs 324 vec4 staging loads (one per
+// patch pixel) for the whole 16x16 block, and the compute loop then reads shared memory only.
+//
+// Weights keep the oihw order with every 3x3 kernel row padded to 12 floats
+// (tools/oidn/export_oidn_weights.py).
+
+#version 450
+
+#ifdef OIDN_HALF_TENSOR
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+#ifdef OIDN_HALF_TENSOR
+layout(std430, binding = 0) readonly buffer SrcBuf { float16_t src[]; };
+layout(std430, binding = 1) writeonly buffer DstBuf { float16_t dst[]; };
+#else
+layout(std430, binding = 0) readonly buffer SrcBuf { vec4 src[]; };
+layout(std430, binding = 1) writeonly buffer DstBuf { vec4 dst[]; };
+#endif
+layout(std430, binding = 2) readonly buffer WgtBuf { float wgt[]; };
+
+layout(push_constant) uniform Pc {
+  int cin;
+  int cout;
+  int width;
+  int height;
+  int relu;
+  int weightOfs;  // in floats, 16-byte aligned
+} pc;
+
+const int GROUP = 8;          // output channels per work group
+const int BLOCK = 16;         // output pixels per block, in each dimension
+const int PATCH = BLOCK + 2;  // 18: the block plus one pixel of padding on each side
+const int PATCH_PIX = PATCH * PATCH;
+const int CHUNK = 4;          // input channels staged at once (one blocked chunk)
+
+shared float tileBuf[CHUNK * PATCH_PIX];  // 4 * 324 floats = 5.1 KB, channel planes
+
+int pad4(int c) { return (c + 3) & -4; }
+
+// Read the 4 channels at float offset `base` (a multiple of 4) into shared channel planes.
+void stage4(int base, int p) {
+#ifdef OIDN_HALF_TENSOR
+  tileBuf[0 * PATCH_PIX + p] = float(src[base + 0]);
+  tileBuf[1 * PATCH_PIX + p] = float(src[base + 1]);
+  tileBuf[2 * PATCH_PIX + p] = float(src[base + 2]);
+  tileBuf[3 * PATCH_PIX + p] = float(src[base + 3]);
+#else
+  vec4 v = src[base >> 2];
+  tileBuf[0 * PATCH_PIX + p] = v.x;
+  tileBuf[1 * PATCH_PIX + p] = v.y;
+  tileBuf[2 * PATCH_PIX + p] = v.z;
+  tileBuf[3 * PATCH_PIX + p] = v.w;
+#endif
+}
+
+void stage4_zero(int p) {
+  tileBuf[0 * PATCH_PIX + p] = 0.0;
+  tileBuf[1 * PATCH_PIX + p] = 0.0;
+  tileBuf[2 * PATCH_PIX + p] = 0.0;
+  tileBuf[3 * PATCH_PIX + p] = 0.0;
+}
+
+// Store 4 output channels at float offset `base` (a multiple of 4).
+void store4(int base, vec4 v) {
+#ifdef OIDN_HALF_TENSOR
+  dst[base + 0] = float16_t(v.x);
+  dst[base + 1] = float16_t(v.y);
+  dst[base + 2] = float16_t(v.z);
+  dst[base + 3] = float16_t(v.w);
+#else
+  dst[base >> 2] = v;
+#endif
+}
+
+void main() {
+  const int lx = int(gl_LocalInvocationID.x);  // 0..7
+  const int ly = int(gl_LocalInvocationID.y);  // 0..7
+  const int tid = ly * 8 + lx;
+  // The block origin comes from the work group index: gl_GlobalInvocationID.x already
+  // includes the local size, so it cannot be used directly here.
+  const int x0 = int(gl_WorkGroupID.x) * BLOCK;
+  const int y0 = int(gl_WorkGroupID.y) * BLOCK;
+  const int og = int(gl_GlobalInvocationID.z) * GROUP;
+  if (x0 >= pc.width || y0 >= pc.height || og >= pc.cout) return;
+
+  const int cin = pc.cin;
+  const int cout = pc.cout;
+  const int w = pc.width;
+  const int h = pc.height;
+  const int srcStride = pad4(cin);   // channel stride of the source tensor
+  const int dstStride = pad4(cout);  // channel stride of the destination tensor
+  const int biasOfs = pc.weightOfs + cout * cin * 12;
+
+  // Accumulators: 2x2 pixels x GROUP output channels. Channels past cout are padding in the
+  // destination tensor and must be written deterministically, so they start at zero.
+  float acc[2][2][GROUP];
+  for (int g = 0; g < GROUP; ++g) {
+    const int o = og + g;
+    const float b = (o < cout) ? wgt[biasOfs + o] : 0.0;
+    acc[0][0][g] = b;
+    acc[1][0][g] = b;
+    acc[0][1][g] = b;
+    acc[1][1][g] = b;
+  }
+
+  for (int c0 = 0; c0 < cin; c0 += CHUNK) {
+    const int nch = min(CHUNK, cin - c0);
+
+    // Stage the 18x18 patch of this 4-channel chunk: one blocked chunk per patch pixel, one
+    // thread per patch pixel, 4 channels at a time.
+    for (int p = tid; p < PATCH_PIX; p += 64) {
+      const int px = p % PATCH;  // patch column, -1..16 relative to the block
+      const int py = p / PATCH;
+      const int sx = x0 + px - 1;
+      const int sy = y0 + py - 1;
+      if (sx >= 0 && sx < w && sy >= 0 && sy < h)
+        stage4((sy * w + sx) * srcStride + c0, p);
+      else
+        stage4_zero(p);
+    }
+    barrier();
+
+    for (int c = 0; c < nch; ++c) {
+      const int i = c0 + c;
+      // 4x4 voxel window covering the 2x2 pixel block, read once and reused by all outputs
+      float v[4][4];
+      for (int dy = 0; dy < 4; ++dy) {
+        for (int dx = 0; dx < 4; ++dx) {
+          v[dy][dx] = tileBuf[c * PATCH_PIX + (ly * 2 + dy) * PATCH + (lx * 2 + dx)];
+        }
+      }
+
+      for (int g = 0; g < GROUP; ++g) {
+        const int o = og + g;
+        if (o >= cout) break;
+        const int base = pc.weightOfs + (o * cin + i) * 12;
+        float k0 = wgt[base + 0], k1 = wgt[base + 1], k2 = wgt[base + 2];
+        float k3 = wgt[base + 3], k4 = wgt[base + 4], k5 = wgt[base + 5];
+        float k6 = wgt[base + 6], k7 = wgt[base + 7], k8 = wgt[base + 8];
+        for (int py = 0; py < 2; ++py) {
+          for (int px = 0; px < 2; ++px) {
+            float s = k0 * v[py + 0][px + 0] + k1 * v[py + 0][px + 1] + k2 * v[py + 0][px + 2] +
+                      k3 * v[py + 1][px + 0] + k4 * v[py + 1][px + 1] + k5 * v[py + 1][px + 2] +
+                      k6 * v[py + 2][px + 0] + k7 * v[py + 2][px + 1] + k8 * v[py + 2][px + 2];
+            acc[px][py][g] += s;
+          }
+        }
+      }
+    }
+    barrier();  // the next chunk overwrites the staged patch
+  }
+
+  // Store: one blocked 4-channel chunk per store, so the whole 2x2 block costs 2 stores per pixel
+  // instead of 8. og is a multiple of GROUP (8) and dstStride a multiple of 4, so every store
+  // offset stays 16-byte aligned.
+  for (int g0 = 0; g0 < GROUP; g0 += 4) {
+    if (og + g0 + 4 > dstStride) break;
+    for (int py = 0; py < 2; ++py) {
+      const int y = y0 + ly * 2 + py;
+      if (y >= h) break;
+      for (int px = 0; px < 2; ++px) {
+        const int x = x0 + lx * 2 + px;
+        if (x >= w) break;
+        vec4 r = vec4(acc[px][py][g0 + 0], acc[px][py][g0 + 1], acc[px][py][g0 + 2],
+                      acc[px][py][g0 + 3]);
+        if (pc.relu != 0) r = max(r, vec4(0.0));
+        store4((y * w + x) * dstStride + og + g0, r);
+      }
+    }
+  }
+}

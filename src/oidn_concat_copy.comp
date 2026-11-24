@@ -1,0 +1,56 @@
+// oidn_concat_copy.comp -- copies one tensor into a slice of channels of another tensor.
+// Used for the U-Net skip connections: the concatenation tensor already holds the upsampled
+// decoder output in channels [0, C_up), and the encoder feature map goes to [C_up, C_up + C).
+//
+// One thread per pixel and 4-channel blocked chunk: the source stride, the destination stride and
+// the channel offset are all multiples of 4, so the copy is one aligned 16-byte (FP32) / 8-byte
+// (FP16) block per thread.
+
+#version 450
+
+#ifdef OIDN_HALF_TENSOR
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+#ifdef OIDN_HALF_TENSOR
+layout(std430, binding = 0) readonly buffer SrcBuf { float16_t src[]; };
+layout(std430, binding = 1) writeonly buffer DstBuf { float16_t dst[]; };
+#else
+layout(std430, binding = 0) readonly buffer SrcBuf { vec4 src[]; };
+layout(std430, binding = 1) writeonly buffer DstBuf { vec4 dst[]; };
+#endif
+
+layout(push_constant) uniform Pc {
+  int channels;     // channels to copy
+  int width;
+  int height;
+  int srcChannels;  // source tensor stride, which can exceed `channels` (the 9-channel input)
+  int dstChannels;
+  int dstOfsC;
+} pc;
+
+int pad4(int c) { return (c + 3) & -4; }
+
+void main() {
+  const int x = int(gl_GlobalInvocationID.x);
+  const int y = int(gl_GlobalInvocationID.y);
+  const int c0 = int(gl_GlobalInvocationID.z) * 4;
+  const int srcStride = pad4(pc.srcChannels);
+  const int dstStride = pad4(pc.dstChannels);
+  if (x >= pc.width || y >= pc.height || c0 >= pad4(pc.channels)) return;
+
+  const int srcBase = (y * pc.width + x) * srcStride + c0;
+  const int dstBase = (y * pc.width + x) * dstStride + pc.dstOfsC + c0;
+
+#ifdef OIDN_HALF_TENSOR
+  dst[dstBase + 0] = src[srcBase + 0];
+  dst[dstBase + 1] = src[srcBase + 1];
+  dst[dstBase + 2] = src[srcBase + 2];
+  dst[dstBase + 3] = src[srcBase + 3];
+#else
+  dst[dstBase >> 2] = src[srcBase >> 2];
+#endif
+}

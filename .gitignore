@@ -1,0 +1,31 @@
+# Build output (CMake + Visual Studio). Regenerate with:
+#   cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+build/
+out/
+*.spv.tmp
+
+# Compiled SPIR-V modules (produced by the CMake custom targets).
+# Exception: the minimal-compute module is committed on purpose so the vadd flow
+# can be exercised on machines without clspv.
+*.spv
+!shaders/vadd.spv
+
+# A locally built clspv can be dropped here; the binaries are not tracked.
+tools/clspv/bin/*.exe
+
+# Render output (the PNG previews used by the README live in docs/)
+renders/*
+!renders/.gitkeep
+
+# Raw render dumps (large, 8-bit RGB); only the PNG previews are kept
+*.ppm
+*.f32
+
+# Editor / OS noise
+.vs/
+*.user
+*.suo
+*.VC.db
+.vscode/
+.DS_Store
+Thumbs.db

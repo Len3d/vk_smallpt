@@ -1,0 +1,95 @@
+// oidn_conv.comp -- 3x3 convolution with padding 1, stride 1, optional fused ReLU.
+//
+// This is the only compute-heavy pass of the U-Net (core/conv.h in OIDN: dnnl convolution_direct
+// with padding = {1,1}, plus eltwise_relu for every layer except dec_conv0).
+//
+// One thread computes GROUP output channels of one pixel, so a dispatch covers the whole layer:
+//   x = pixel x, y = pixel y, z = output channel group.
+// Tensors are pixel-major (HWC) float32. Weights keep the oihw order with every 3x3 kernel row
+// padded to 12 floats (tools/oidn/export_oidn_weights.py), which keeps all rows 16-byte aligned:
+//   row base (floats): weightOfs + (o * cin + i) * 12
+//   bias:              weightOfs + cout * cin * 12
+// (A vec4-based fetch of those three rows was tried and measured slower on this GPU: the extra
+// unpacking and register pressure cost more than the saved load instructions.)
+//
+// Historical note: this tree also has an FP16 storage experiment. Build the shaders with
+// -DOIDN_HALF_TENSOR=1 and the two tensors become FP16 while the weights, the shared-memory patch
+// and every accumulator stay FP32; that is the same split OIDN's CUDA backend uses by default
+// (FP16 storage, FP32 accumulate, see devices/cuda/cuda_conv.cu). oidn_denoise.cpp selects the
+// variant at run time with OIDN_STORE=fp16.
+
+#version 450
+
+#ifdef OIDN_HALF_TENSOR
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#define TENSOR_T float16_t
+#else
+#define TENSOR_T float
+#endif
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer SrcBuf { TENSOR_T src[]; };
+layout(std430, binding = 1) writeonly buffer DstBuf { TENSOR_T dst[]; };
+layout(std430, binding = 2) readonly buffer WgtBuf { float wgt[]; };
+
+layout(push_constant) uniform Pc {
+  int cin;
+  int cout;
+  int width;
+  int height;
+  int relu;
+  int weightOfs;  // in floats, 16-byte aligned
+} pc;
+
+const int GROUP = 8;
+
+void main() {
+  const int x = int(gl_GlobalInvocationID.x);
+  const int y = int(gl_GlobalInvocationID.y);
+  const int og = int(gl_GlobalInvocationID.z) * GROUP;
+  if (x >= pc.width || y >= pc.height || og >= pc.cout) return;
+
+  const int cin = pc.cin;
+  const int cout = pc.cout;
+  const int w = pc.width;
+  const int h = pc.height;
+  const int srcStride = (cin + 3) & -4;   // channel-blocked: stride padded to a multiple of 4
+  const int dstStride = (cout + 3) & -4;
+  const int biasOfs = pc.weightOfs + cout * cin * 12;
+
+  float acc[GROUP];
+  for (int g = 0; g < GROUP; ++g) {
+    const int o = og + g;
+    acc[g] = (o < cout) ? wgt[biasOfs + o] : 0.0;
+  }
+
+  for (int i = 0; i < cin; ++i) {
+    // Load the 3x3 neighbourhood of input channel i once, then reuse it for all GROUP outputs.
+    float v[9];
+    for (int t = 0; t < 9; ++t) {
+      const int sx = x + (t % 3) - 1;
+      const int sy = y + (t / 3) - 1;
+      v[t] = (sx >= 0 && sx < w && sy >= 0 && sy < h) ? float(src[(sy * w + sx) * srcStride + i]) : 0.0;
+    }
+    const int rowBase = pc.weightOfs + i * 12;
+    for (int g = 0; g < GROUP; ++g) {
+      const int o = og + g;
+      if (o >= cout) break;
+      const int base = rowBase + o * cin * 12;
+      float s = wgt[base + 0] * v[0] + wgt[base + 1] * v[1] + wgt[base + 2] * v[2] +
+                wgt[base + 3] * v[3] + wgt[base + 4] * v[4] + wgt[base + 5] * v[5] +
+                wgt[base + 6] * v[6] + wgt[base + 7] * v[7] + wgt[base + 8] * v[8];
+      acc[g] += s;
+    }
+  }
+
+  for (int g = 0; g < GROUP; ++g) {
+    const int o = og + g;
+    if (o >= cout) break;
+    float r = acc[g];
+    if (pc.relu != 0) r = max(r, 0.0);
+    dst[(y * w + x) * dstStride + o] = TENSOR_T(r);
+  }
+}

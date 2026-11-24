@@ -1,0 +1,59 @@
+// oidn_upsample.comp -- 2x nearest-neighbour upsampling (core/upsample.cpp: every source value is
+// written to a 2x2 block), writing straight into a concatenation buffer at a channel offset.
+// That removes one full tensor copy per decoder stage.
+//
+// One thread per destination pixel and 4-channel blocked chunk. Both the channel offset and the
+// channel stride are multiples of 4, so each step is a single aligned 16-byte (FP32) / 8-byte
+// (FP16) load-store pair that covers the whole chunk.
+
+#version 450
+
+#ifdef OIDN_HALF_TENSOR
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+#ifdef OIDN_HALF_TENSOR
+layout(std430, binding = 0) readonly buffer SrcBuf { float16_t src[]; };
+layout(std430, binding = 1) writeonly buffer DstBuf { float16_t dst[]; };
+#else
+layout(std430, binding = 0) readonly buffer SrcBuf { vec4 src[]; };
+layout(std430, binding = 1) writeonly buffer DstBuf { vec4 dst[]; };
+#endif
+
+layout(push_constant) uniform Pc {
+  int channels;     // channels of the source tensor (also the number written)
+  int srcWidth;
+  int srcHeight;
+  int dstWidth;     // width of the destination concatenation tensor
+  int dstHeight;
+  int dstChannels;  // channel count of the destination tensor
+  int dstOfsC;      // first channel written in the destination
+} pc;
+
+int pad4(int c) { return (c + 3) & -4; }
+
+void main() {
+  const int dx = int(gl_GlobalInvocationID.x);
+  const int dy = int(gl_GlobalInvocationID.y);
+  const int c0 = int(gl_GlobalInvocationID.z) * 4;
+  const int srcStride = pad4(pc.channels);
+  const int dstStride = pad4(pc.dstChannels);
+  if (dx >= pc.dstWidth || dy >= pc.dstHeight || c0 >= srcStride) return;
+
+  const int sx = dx / 2;
+  const int sy = dy / 2;
+  const int srcBase = (sy * pc.srcWidth + sx) * srcStride + c0;
+  const int dstBase = (dy * pc.dstWidth + dx) * dstStride + pc.dstOfsC + c0;
+
+#ifdef OIDN_HALF_TENSOR
+  dst[dstBase + 0] = src[srcBase + 0];
+  dst[dstBase + 1] = src[srcBase + 1];
+  dst[dstBase + 2] = src[srcBase + 2];
+  dst[dstBase + 3] = src[srcBase + 3];
+#else
+  dst[dstBase >> 2] = src[srcBase >> 2];
+#endif
+}

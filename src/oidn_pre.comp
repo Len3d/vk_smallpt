@@ -1,0 +1,125 @@
+// oidn_pre.comp -- OIDN input reorder: linear HDR RGB (plus optional albedo / normal) -> the
+// U-Net's normalized input tensor.
+//
+// Mirrors core/input_reorder.ispc followed by core/color.ispc, including OIDN's tile mapping: the
+// tile buffer is tileW x tileH, the valid image content sits at (ofsX, ofsY) inside it, and
+// everything else is zero -- exactly what InputReorder::setTile(h, w, hDstBegin, wDstBegin,
+// tileH1, tileW1) does.
+//
+// The three channel groups are transferred differently (input_reorder.ispc storeColor /
+// storeAlbedo / storeNormal, all with color present, which is our case):
+//   color  : * inputScale, clamp [0, 65504], then the PU curve, * normScale
+//   albedo : clamp [0, 1], no scaling and no transfer function
+//   normal : clamp [-1, 1], then remapped to [0, 1] with v * 0.5 + 0.5, no scaling
+// The albedo / normal images are read through the same tile mapping as the color image.
+//
+// Build with -DOIDN_HALF_TENSOR=1 to store the destination tensor as FP16; the source images stay
+// FP32 and the transfer function runs in FP32, exactly like OIDN's GPUInputProcess, which keeps
+// `float values[]` and only converts when storing to the FP16 tensor.
+
+#version 450
+
+#ifdef OIDN_HALF_TENSOR
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#define TENSOR_T float16_t
+#else
+#define TENSOR_T float
+#endif
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer SrcBuf { float src[]; };      // color, full image, rgba
+layout(std430, binding = 1) writeonly buffer DstBuf { TENSOR_T dst[]; };  // tile tensor, cin channels
+layout(std430, binding = 3) readonly buffer AlbBuf { float alb[]; };      // albedo, full image, rgba
+layout(std430, binding = 4) readonly buffer NrmBuf { float nrm[]; };      // normal, full image, rgba
+
+layout(push_constant) uniform Pc {
+  float inputScale;   // 0.18 / exp2(mean log2 luminance), from getAutoexposure
+  float normScale;    // 1 / puForward(65504)
+  int tileW;
+  int tileH;
+  int imgW;           // image width, i.e. the stride of the source buffers
+  int srcX;           // image position of the tile's first valid pixel
+  int srcY;
+  int validW;         // valid content size inside the tile
+  int validH;
+  int ofsX;           // where that content starts inside the tile buffer
+  int ofsY;
+  int cin;            // destination channels: 3 (color), 6 (+albedo), 9 (+albedo+normal)
+  int nAux;           // number of auxiliary images present: 0, 1 (albedo) or 2 (albedo+normal)
+} pc;
+
+const float PU_A = 1.41283765e+03;
+const float PU_B = 1.64593172e+00;
+const float PU_C = 4.31384981e-01;
+const float PU_D = -2.94139609e-03;
+const float PU_E = 1.92653254e-01;
+const float PU_F = 6.26026094e-03;
+const float PU_G = 9.98620152e-01;
+const float PU_Y0 = 1.57945760e-06;
+const float PU_Y1 = 3.22087631e-02;
+const float HDR_Y_MAX = 65504.0;
+
+float puForward(float y) {
+  if (y <= PU_Y0) {
+    return PU_A * y;
+  } else if (y <= PU_Y1) {
+    return PU_B * pow(y, PU_C) + PU_D;
+  } else {
+    return PU_E * log(y + PU_F) + PU_G;
+  }
+}
+
+float sanitize(float v) {
+  // nan_to_zero(v), as in input_reorder.ispc
+  if (isnan(v)) return 0.0;
+  return v;
+}
+
+void main() {
+  const int x = int(gl_GlobalInvocationID.x);
+  const int y = int(gl_GlobalInvocationID.y);
+  if (x >= pc.tileW || y >= pc.tileH) return;
+
+  // Channel-blocked layout: the tensor's channel stride is pc.cin padded to a multiple of 4.
+  const int stride = (pc.cin + 3) & -4;
+  const int dstBase = (y * pc.tileW + x) * stride;
+
+  const int vx = x - pc.ofsX;
+  const int vy = y - pc.ofsY;
+  if (vx < 0 || vy < 0 || vx >= pc.validW || vy >= pc.validH) {
+    // Zero padding of the tile (alignment slack and the area outside the image), including the
+    // blocked padding channels so the tensor never holds uninitialized values.
+    for (int c = 0; c < stride; ++c) dst[dstBase + c] = TENSOR_T(0.0);
+    return;
+  }
+
+  const int pix = (pc.srcY + vy) * pc.imgW + (pc.srcX + vx);
+  const int srcIdx = pix * 4;
+
+  // Color: scale, clamp to [0, 65504], PU curve
+  for (int c = 0; c < 3; ++c) {
+    float v = sanitize(src[srcIdx + c]) * pc.inputScale;
+    v = clamp(v, 0.0, HDR_Y_MAX);
+    dst[dstBase + c] = TENSOR_T(puForward(v) * pc.normScale);
+  }
+
+  // Albedo: clamp to [0, 1], untouched
+  if (pc.nAux >= 1) {
+    for (int c = 0; c < 3; ++c) {
+      dst[dstBase + 3 + c] = TENSOR_T(clamp(sanitize(alb[srcIdx + c]), 0.0, 1.0));
+    }
+  }
+
+  // Blocked padding channels: zero them so the consumer never reads uninitialized memory.
+  for (int c = pc.cin; c < stride; ++c) dst[dstBase + c] = TENSOR_T(0.0);
+
+  // Normal: clamp to [-1, 1], remap to [0, 1]
+  if (pc.nAux >= 2) {
+    for (int c = 0; c < 3; ++c) {
+      float v = clamp(sanitize(nrm[srcIdx + c]), -1.0, 1.0);
+      dst[dstBase + 6 + c] = TENSOR_T(v * 0.5 + 0.5);
+    }
+  }
+}

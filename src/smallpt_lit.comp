@@ -1,0 +1,298 @@
+// smallpt_lit.comp -- the GLSL counterpart, equivalent line by line to src/smallpt_lit.cl:
+// it uses macros with literal subscripts to write out the 6 walls and the 3 spheres by hand, and
+// carries the hit information in registers.
+//
+// Why: glslc materializes a constant array such as `const vec4 P[6]` into
+// `OpVariable %_ptr_Function__arr_v4float_uint_6 Function` (Function storage class),
+// so `P[i]` inside the loop is a dynamic `OpAccessChain` -- the same shape as clspv demoting
+// __constant to Private (only the storage class is called Function instead of Private).
+// Once the subscripts become compile-time constants, those arrays and the AccessChains disappear.
+//
+// Build:
+//   glslc --target-env=vulkan1.2 -O src/smallpt_lit.comp -o build/smallpt_lit_glsl.spv
+//   smallpt.exe build\smallpt_lit_glsl.spv 480 360 32 out.ppm main
+
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, set = 0, binding = 0) buffer Img { float img[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Alb { float alb[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Nrm { float nrm[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Params { uint params[]; };
+
+const float PI = 3.14159265358979;
+const float EPS = 1e-4;
+const float BIG = 1e20;
+const int MAX_DEPTH = 10;
+const float CAM_PUSH = 140.0;
+
+const int MAT_DIFF = 0;
+const int MAT_SPEC = 1;
+const int MAT_GLASS = 2;
+
+const int NPLANE = 6;
+const int NSPHERE = 3;
+
+// Six walls: vec4(nx,ny,nz,d) with normals pointing into the box
+const vec4 PLANE_GEO[6] = vec4[6](
+    vec4( 1.0,  0.0,  0.0,   1.0),
+    vec4(-1.0,  0.0,  0.0, -99.0),
+    vec4( 0.0,  0.0,  1.0,   0.0),
+    vec4( 0.0,  0.0, -1.0, -170.0),
+    vec4( 0.0,  1.0,  0.0,   0.0),
+    vec4( 0.0, -1.0,  0.0, -81.6)
+);
+const vec3 PLANE_COL[6] = vec3[6](
+    vec3(0.75, 0.25, 0.25),
+    vec3(0.25, 0.25, 0.75),
+    vec3(0.75, 0.75, 0.75),
+    vec3(0.0,  0.0,  0.0),
+    vec3(0.75, 0.75, 0.75),
+    vec3(0.75, 0.75, 0.75)
+);
+
+// Three spheres: vec4(center, radius)
+const vec4 SPH_GEO[3] = vec4[3](
+    vec4(27.0, 16.5, 47.0, 16.5),
+    vec4(73.0, 16.5, 78.0, 16.5),
+    vec4(50.0, 681.6 - 0.27, 81.6, 600.0)
+);
+const vec3 SPH_COL[3] = vec3[3](
+    vec3(0.999, 0.999, 0.999),
+    vec3(0.999, 0.999, 0.999),
+    vec3(0.0, 0.0, 0.0)
+);
+const vec3 SPH_EMIT[3] = vec3[3](
+    vec3(0.0, 0.0, 0.0),
+    vec3(0.0, 0.0, 0.0),
+    vec3(12.0, 12.0, 12.0)
+);
+const int SPH_MAT[3] = int[3](MAT_SPEC, MAT_GLASS, MAT_DIFF);
+
+// I must be a literal so that PLANE_GEO[I] stays a constant subscript
+#define TRY_PLANE(I)                                                          \
+  {                                                                           \
+    vec3 n_ = PLANE_GEO[I].xyz;                                               \
+    float den_ = dot(n_, d);                                                  \
+    if (!(den_ > -1e-8 && den_ < 1e-8)) {                                     \
+      float t_ = (PLANE_GEO[I].w - dot(n_, o)) / den_;                        \
+      if (t_ > EPS && t_ < best) {                                            \
+        best = t_; id = (I); hn = n_; ha = PLANE_COL[I]; he = vec3(0.0);      \
+        hm = MAT_DIFF;                                                        \
+      }                                                                       \
+    }                                                                         \
+  }
+
+#define TRY_SPHERE(I)                                                         \
+  {                                                                           \
+    vec3 p_ = SPH_GEO[I].xyz;                                                 \
+    float rad_ = SPH_GEO[I].w;                                                \
+    vec3 op_ = p_ - o;                                                        \
+    float b_ = dot(op_, d);                                                   \
+    float c_ = dot(op_, op_) - rad_ * rad_;                                   \
+    float det_ = b_ * b_ - c_;                                                \
+    if (det_ >= 0.0) {                                                        \
+      float sq_ = sqrt(det_);                                                 \
+      float t0_ = b_ - sq_;                                                   \
+      if (t0_ > EPS && t0_ < best) {                                          \
+        best = t0_; id = NPLANE + (I); hn = vec3(0.0); hc = p_;               \
+        hm = SPH_MAT[I]; ha = SPH_COL[I]; he = SPH_EMIT[I];                   \
+      } else {                                                                \
+        float t1_ = b_ + sq_;                                                 \
+        if (t1_ > EPS && t1_ < best) {                                        \
+          best = t1_; id = NPLANE + (I); hn = vec3(0.0); hc = p_;             \
+          hm = SPH_MAT[I]; ha = SPH_COL[I]; he = SPH_EMIT[I];                 \
+        }                                                                     \
+      }                                                                       \
+    }                                                                         \
+  }
+
+float rnd(inout uint s) {
+  s = s * 1664525u + 1013904223u;
+  return float(s >> 8) * (1.0 / 16777216.0);
+}
+
+float clamp1(float x) { return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x); }
+
+vec3 trace(vec3 o, vec3 d, inout uint rngState) {
+  vec3 L = vec3(0.0);
+  vec3 thr = vec3(1.0);
+
+  for (int depth = 0; depth < MAX_DEPTH; ++depth) {
+    // ---- Intersection (inlined, hit info carried in registers) ----
+    float best = BIG;
+    int id = -1;
+    vec3 hn = vec3(0.0), hc = vec3(0.0), ha = vec3(0.0), he = vec3(0.0);
+    int hm = MAT_DIFF;
+
+    TRY_PLANE(0) TRY_PLANE(1) TRY_PLANE(2)
+    TRY_PLANE(3) TRY_PLANE(4) TRY_PLANE(5)
+
+    TRY_SPHERE(0) TRY_SPHERE(1) TRY_SPHERE(2)
+
+    if (id < 0) break;
+
+    vec3 x = o + d * best;
+    vec3 n = (id >= NPLANE) ? normalize(x - hc) : hn;
+    vec3 nl = (dot(n, d) < 0.0) ? n : -n;
+    vec3 f = ha;
+
+    L += thr * he;
+    if (thr.x + thr.y + thr.z <= 0.0) break;
+
+    float pmax = max(f.x, max(f.y, f.z));
+    if (depth > 5) {
+      if (rnd(rngState) < pmax) {
+        f = f * (1.0 / pmax);
+      } else {
+        break;
+      }
+    }
+
+    if (hm == MAT_DIFF) {
+      float r1 = 2.0 * PI * rnd(rngState);
+      float r2 = rnd(rngState);
+      float r2s = sqrt(r2);
+      vec3 w = nl;
+      vec3 u = normalize(cross((abs(w.x) > 0.1) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0), w));
+      vec3 v = cross(w, u);
+      vec3 nd = normalize(u * (cos(r1) * r2s) + v * (sin(r1) * r2s) + w * sqrt(1.0 - r2));
+      thr *= f;
+      o = x;
+      d = nd;
+      continue;
+    } else if (hm == MAT_SPEC) {
+      d = d - n * (2.0 * dot(n, d));
+      thr *= f;
+      o = x;
+      continue;
+    } else {
+      bool into = dot(n, nl) > 0.0;
+      float nc = 1.0, nt = 1.5;
+      float nnt = into ? (nc / nt) : (nt / nc);
+      float ddn = dot(d, nl);
+      float cos2t = 1.0 - nnt * nnt * (1.0 - ddn * ddn);
+      vec3 refl = d - n * (2.0 * dot(n, d));
+      if (cos2t < 0.0) {
+        d = refl;
+        thr *= f;
+        o = x;
+        continue;
+      }
+      vec3 tdir = normalize(d * nnt - n * ((into ? 1.0 : -1.0) * (ddn * nnt + sqrt(cos2t))));
+      float a = nt - nc, b = nt + nc;
+      float R0 = (a * a) / (b * b);
+      float cc = 1.0 - (into ? (-ddn) : dot(tdir, n));
+      float c2 = cc * cc, c4 = c2 * c2, c5 = c4 * cc;
+      float Re = R0 + (1.0 - R0) * c5;
+      float Tr = 1.0 - Re;
+      float P = 0.25 + 0.5 * Re;
+      float RP = Re / P;
+      float TP = Tr / (1.0 - P);
+      if (rnd(rngState) < P) {
+        d = refl;
+        thr *= f * RP;
+      } else {
+        d = tdir;
+        thr *= f * TP;
+      }
+      o = x;
+      continue;
+    }
+  }
+  return L;
+}
+
+// First hit of a primary ray, used only to fill the denoiser's albedo / normal images. It reuses the
+// same literal-subscript macros as trace(), so no subscript becomes dynamic here either.
+void firstHit(vec3 o, vec3 d, out vec3 albOut, out vec3 nrmOut) {
+  float best = BIG;
+  int id = -1;
+  vec3 hn = vec3(0.0);
+  vec3 hc = vec3(0.0);
+  vec3 ha = vec3(0.0);
+  vec3 he = vec3(0.0);
+  int hm = MAT_DIFF;
+
+  TRY_PLANE(0) TRY_PLANE(1) TRY_PLANE(2)
+  TRY_PLANE(3) TRY_PLANE(4) TRY_PLANE(5)
+
+  TRY_SPHERE(0) TRY_SPHERE(1) TRY_SPHERE(2)
+
+  albOut = vec3(0.0);
+  nrmOut = vec3(0.0, 0.0, 1.0);
+  if (id >= 0) {
+    albOut = ha;
+    nrmOut = (id >= NPLANE) ? normalize(o + d * best - hc) : hn;
+  }
+}
+
+void main() {
+  uint w = params[0];
+  uint h = params[1];
+  uint spp = params[2];
+  uint frame = params[3];
+
+  uint px = gl_GlobalInvocationID.x;
+  uint py = gl_GlobalInvocationID.y;
+  if (px >= w || py >= h) return;
+
+  float aspect = float(w) / float(h);
+  vec3 camO = vec3(50.0, 52.0, 295.6);
+  vec3 camD = normalize(vec3(0.0, -0.042612, -1.0));
+  vec3 cx = vec3(aspect * 0.5135, 0.0, 0.0);
+  vec3 cy = normalize(cross(cx, camD)) * 0.5135;
+
+  uint rngState = (py * w + px) * 1973u + frame * 9277u + 1u;
+
+  float pyUp = float(h - 1u - py);
+  vec3 rad = vec3(0.0);
+
+  // ---- auxiliary images for the denoiser ----------------------------------
+  vec3 alb_v = vec3(0.0);
+  vec3 nrm_v = vec3(0.0, 0.0, 1.0);
+  {
+    vec3 gDir = normalize(camD
+                         + cx * (((float(px) + 0.5) / float(w)) - 0.5)
+                         + cy * (((pyUp + 0.5) / float(h)) - 0.5));
+    firstHit(camO + gDir * CAM_PUSH, gDir, alb_v, nrm_v);
+  }
+
+  for (uint sy = 0; sy < 2; ++sy) {
+    for (uint sx = 0; sx < 2; ++sx) {
+      vec3 sub = vec3(0.0);
+      for (uint s = 0; s < spp; ++s) {
+        float r1 = 2.0 * rnd(rngState);
+        float dx = (r1 < 1.0) ? (sqrt(r1) - 1.0) : (1.0 - sqrt(2.0 - r1));
+        float r2 = 2.0 * rnd(rngState);
+        float dy = (r2 < 1.0) ? (sqrt(r2) - 1.0) : (1.0 - sqrt(2.0 - r2));
+
+        vec3 dRaw = cx * (((float(sx) + 0.5 + dx) * 0.5 + float(px)) / float(w) - 0.5)
+                  + cy * (((float(sy) + 0.5 + dy) * 0.5 + float(pyUp)) / float(h) - 0.5)
+                  + camD;
+        vec3 d = normalize(dRaw);
+        vec3 start = camO + d * CAM_PUSH;
+        sub += trace(start, d, rngState);
+      }
+      sub *= 1.0 / float(spp);
+      rad += vec3(clamp1(sub.x), clamp1(sub.y), clamp1(sub.z));
+    }
+  }
+  rad *= 0.25;
+
+  uint idx = (py * w + px) * 4;
+  img[idx + 0] = rad.x;
+  img[idx + 1] = rad.y;
+  img[idx + 2] = rad.z;
+  img[idx + 3] = 1.0;
+
+  uint aidx = (py * w + px) * 3;
+  alb[aidx + 0] = alb_v.x;
+  alb[aidx + 1] = alb_v.y;
+  alb[aidx + 2] = alb_v.z;
+  nrm[aidx + 0] = nrm_v.x;
+  nrm[aidx + 1] = nrm_v.y;
+  nrm[aidx + 2] = nrm_v.z;
+}

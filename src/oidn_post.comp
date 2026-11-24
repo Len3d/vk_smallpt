@@ -1,0 +1,94 @@
+// oidn_post.comp -- OIDN output reorder: sanitize the network output, undo the PU transfer
+// function and undo the autoexposure scale (core/output_reorder.ispc, outputScale = 1/inputScale).
+//
+// Tile mapping matches OutputReorder::setTile(hDstBegin, wDstBegin, hSrcBegin, wSrcBegin, H, W):
+// the tile rows [ofsY, ofsY + outH) / columns [ofsX, ofsX + outW) go to the image starting at
+// (outX, outY). The rest of the tile (the 96-pixel overlap and the alignment slack) is dropped.
+//
+// The tile tensor is channel-blocked (stride padded to 4), so the three output channels come from
+// one aligned chunk: a single vec4 load in FP32, four half loads in FP16.
+
+#version 450
+
+#ifdef OIDN_HALF_TENSOR
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+#ifdef OIDN_HALF_TENSOR
+layout(std430, binding = 0) readonly buffer SrcBuf { float16_t src[]; };
+#else
+layout(std430, binding = 0) readonly buffer SrcBuf { vec4 src[]; };
+#endif
+layout(std430, binding = 1) writeonly buffer DstBuf { float dst[]; };  // full image, rgba
+
+layout(push_constant) uniform Pc {
+  float rcpNormScale;  // puForward(65504)
+  float outputScale;   // 1 / inputScale
+  int tileW;
+  int tileH;
+  int imgW;            // image width, i.e. the stride of the destination buffer
+  int outX;            // image position of the tile's first written pixel
+  int outY;
+  int outW;            // number of pixels written from this tile
+  int outH;
+  int ofsX;            // where those pixels start inside the tile buffer
+  int ofsY;
+} pc;
+
+const float PU_A = 1.41283765e+03;
+const float PU_B = 1.64593172e+00;
+const float PU_C = 4.31384981e-01;
+const float PU_D = -2.94139609e-03;
+const float PU_E = 1.92653254e-01;
+const float PU_F = 6.26026094e-03;
+const float PU_G = 9.98620152e-01;
+const float PU_X0 = 2.23151711e-03;
+const float PU_X1 = 3.70974749e-01;
+const float FLT_MAX_V = 3.4028235e+38;
+
+float puInverse(float x) {
+  if (x <= PU_X0) {
+    return x / PU_A;
+  } else if (x <= PU_X1) {
+    return pow((x - PU_D) / PU_B, 1.0 / PU_C);
+  } else {
+    return exp((x - PU_G) / PU_E) - PU_F;
+  }
+}
+
+float sanitize(float v) {
+  if (isnan(v) || v < 0.0) return 0.0;
+  return min(v, FLT_MAX_V);
+}
+
+void main() {
+  const int x = int(gl_GlobalInvocationID.x);
+  const int y = int(gl_GlobalInvocationID.y);
+  if (x >= pc.tileW || y >= pc.tileH) return;
+
+  const int vx = x - pc.ofsX;
+  const int vy = y - pc.ofsY;
+  if (vx < 0 || vy < 0 || vx >= pc.outW || vy >= pc.outH) return;
+
+  const int srcBase = (y * pc.tileW + x) * 4;  // the output tensor has 3 channels padded to 4
+  const int dstIdx = ((pc.outY + vy) * pc.imgW + (pc.outX + vx)) * 4;
+
+#ifdef OIDN_HALF_TENSOR
+  float v0 = float(src[srcBase + 0]);
+  float v1 = float(src[srcBase + 1]);
+  float v2 = float(src[srcBase + 2]);
+#else
+  vec4 c = src[srcBase >> 2];
+  float v0 = c.x;
+  float v1 = c.y;
+  float v2 = c.z;
+#endif
+
+  dst[dstIdx + 0] = puInverse(sanitize(v0) * pc.rcpNormScale) * pc.outputScale;
+  dst[dstIdx + 1] = puInverse(sanitize(v1) * pc.rcpNormScale) * pc.outputScale;
+  dst[dstIdx + 2] = puInverse(sanitize(v2) * pc.rcpNormScale) * pc.outputScale;
+  dst[dstIdx + 3] = 1.0;
+}

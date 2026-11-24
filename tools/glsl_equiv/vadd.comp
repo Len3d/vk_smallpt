@@ -1,0 +1,26 @@
+// Note: this GLSL file is only a reference implementation used to validate the host-side flow
+// (descriptor layout, entry point semantics, dispatch extent) on machines without clspv.
+// It is not the main kernel; the main kernel is src/vadd.cl (OpenCL C).
+//
+// Build with glslc (shipped in the Vulkan SDK):
+//   glslc -fshader-stage=compute tools/glsl_equiv/vadd.comp -o shaders/vadd.spv
+//
+// It matches the SPIR-V that clspv produces from src/vadd.cl in every respect that matters:
+//   * entry point name vadd, stage = compute
+//   * descriptor set 0, bindings 0/1/2 hold one SSBO each (read-only a, read-only b, writeable out)
+//   * the index comes from gl_GlobalInvocationID.x
+// The host code (main.cpp) therefore needs no change whichever module it loads.
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { float a[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer BufO { float o[]; };
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    o[gid] = a[gid] + b[gid];
+}
