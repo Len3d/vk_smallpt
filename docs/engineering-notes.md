@@ -73,7 +73,12 @@ tools/oidn/conv_probe.cpp   runs one convolution pass and compares it against a 
 tools/oidn/rt_hdr.bin       denoiser weights, float32 (4.65 MB, generated from OIDN, Apache-2.0)
 scripts/render_smallpt.ps1  build + render to PNG in one step
 scripts/compare_smallpt.ps1 run seven variants in one command and print a performance / memory table
+scripts/verify_viewer_input.ps1  drives vk_viewer with synthetic mouse/keyboard input and captures the window
 scripts/ppm_diff.py         standard-library-only byte-level PPM comparison (max diff / mean diff / over-threshold share)
+src/smallpt_view.cl         viewer accumulate kernel: one jittered path per pixel into a running per-pixel mean
+src/smallpt_view_resolve.cl viewer resolve kernel: exposure + Reinhard + gamma, packed into uint32
+src/viewer_main.cpp         viewer host: Win32 window, swapchain, ImGui overlay, orbit camera, denoise / save
+third_party/imgui/          ImGui v1.93.0, core + imgui_impl_win32 + imgui_impl_vulkan only (MIT)
 renders/                    render output (one PNG preview per variant)
 ```
 
@@ -1943,6 +1948,53 @@ through `glslc` -> `spirv-dis` -> (rename the `main` entry point to `vadd`) -> `
 host flow working. Now that the real clspv is available that path is kept only as a reference and is
 no longer needed.
 
+## Interactive viewer (`vk_viewer`)
+
+The batch renderer produces one image after N samples; the viewer has to produce one every 16 ms and
+stay interactive while the camera moves. Notes on what that changed:
+
+- **Accumulation lives on the device.** `src/smallpt_view.cl` keeps a `float4` per pixel and does
+  `mean = (old * frame + sample) / (frame + 1)`, so each frame is a single dispatch of one path per
+  pixel and the host only writes the sample index into the parameter buffer. The host never reads
+  the image back unless the denoiser or `--save` asks for it.
+- **The camera can be inside the box.** smallpt pushes the primary ray 140 units along its
+  direction, which is only valid for its single fixed camera. The viewer instead intersects the ray
+  with the room AABB (`x ∈ [1, 99]`, `y ∈ [0, 81.6]`, `z ∈ [0, 170]`) and starts the path at the
+  entry point + 0.01, so a camera anywhere inside (or outside) the room behaves the same way. An
+  early version kept the default camera at distance 210 outside the front wall, which left the
+  corners of the screen black because those rays never entered the box.
+- **The RNG mattered more than expected.** Starting from an LCG seeded with
+  `(py * w + px) * 1973 + frame * 9277` produced *diagonal hatching* in smooth gradients once a
+  few hundred frames had been averaged: neighbouring pixels get seeds that differ by a constant, so
+  their first outputs are linearly related. Replacing it with PCG-XSH-RR plus an avalanched seed
+  (`mix32(px * 0x9E3779B1 ^ py * 0x85EBCA77 ^ frame * 0xC2B2AE3D) | 1`) removed the pattern
+  completely at 150 spp.
+- **Resolve writes `uint32`, not 8-bit.** `src/smallpt_view_resolve.cl` applies exposure, Reinhard
+  tone mapping and gamma, then packs the result into a `uint` per pixel. Writing RGBA8 directly
+  would need `storageBuffer8BitAccess`, which the integrated driver's clspv path does not expose;
+  the host copies the uint buffer into the sampled image instead.
+- **ImGui 1.93 backend API.** The Vulkan backend no longer takes `info.RenderPass`; the render
+  target is `info.PipelineInfoMain.RenderPass / Subpass / MSAASamples`, the descriptor pool can be
+  created by the backend via `info.DescriptorPoolSize`, and font upload is dynamic, so
+  `ImGui_ImplVulkan_CreateFontsTexture()` is gone. `ImGui_ImplVulkan_AddTexture()` returns a
+  `VkDescriptorSet` that is used directly as `ImTextureID`.
+- **Swapchain and image sharing.** The viewport image is `R8G8B8A8_UNORM` with
+  `SAMPLED | TRANSFER_DST`. Each frame: dispatch accumulate → compute barrier → dispatch resolve →
+  barrier → `vkCmdCopyBufferToImage` (the image is first moved from
+  `UNDEFINED | SHADER_READ_ONLY` to `TRANSFER_DST`; skipping that barrier is a layout violation) →
+  `TRANSFER_DST → SHADER_READ_ONLY` → the render pass clears and draws the ImGui draw list. The
+  same image is registered once with the ImGui backend and drawn as a full-window `AddImage`.
+- **Resize** waits for the device, destroys the framebuffers and swapchain views, recreates them at
+  the new extent (taken from `caps.currentExtent`), and rebuilds the accumulation, albedo, normal
+  and viewport images plus the ImGui texture.
+- **Measuring the viewer** is awkward without a person at the keyboard, so
+  `scripts/verify_viewer_input.ps1` does it: it starts the app, finds its window by process id
+  (`MainWindowHandle` is the console, which the app minimises on startup), posts
+  `WM_LBUTTONDOWN` + relative `WM_MOUSEMOVE` + wheel events, posts `WM_KEYDOWN` for `R`, `D` and
+  `S`, and captures the window after each step with `CopyFromScreen`. The script calls
+  `SetProcessDPIAware()` first — without it `GetWindowRect` returns virtualised coordinates, the
+  capture is cropped, and the screenshots look zoomed for no reason.
+
 ## Verified / not verified
 
 Verified (Intel UHD on this machine, Vulkan 1.4.323 vendor driver):
@@ -1955,6 +2007,10 @@ Verified (Intel UHD on this machine, Vulkan 1.4.323 vendor driver):
 - The whole host-side Vulkan compute flow works (device selection, descriptors, pipeline, dispatch,
   barrier, readback validation) with all 1M elements correct (`max |err| = 0`) and
   `VK_LAYER_KHRONOS_validation` enabled without any error.
+
+- `vk_viewer`: builds against the vendored ImGui 1.93.0 and renders ~59 fps at 1000×700; orbit,
+  zoom, `R` reset, `D` denoise (~700 ms) and `S` save were all confirmed with
+  `scripts/verify_viewer_input.ps1`.
 
 Not verified:
 

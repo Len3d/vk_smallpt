@@ -34,6 +34,11 @@ cost of each code generation choice can be measured on one machine, and the deno
   convolution pass against a CPU reference), `tools/oidn/ref_forward.py` (numpy reference of the
   whole network), `tools/oidn/export_oidn_weights.py` (turns OIDN's `rt_hdr.tza` into the flat
   float32 blobs in `tools/oidn/`).
+- **Interactive viewer** — `vk_viewer`, a Win32 window with an ImGui overlay on top of the same
+  path tracer and denoiser: drag to orbit, drag to pan, wheel to zoom, and it denoises and writes
+  PNGs on demand. Two extra kernels (`src/smallpt_view.cl` and `src/smallpt_view_resolve.cl`)
+  keep the running per-pixel mean on the device, so a frame is one dispatch and the host only
+  sends the sample index.
 
 ## Requirements
 
@@ -43,6 +48,7 @@ cost of each code generation choice can be measured on one machine, and the deno
 | CMake | ≥ 3.20 |
 | C++ compiler | MSVC 2022 / any C++17 compiler |
 | clspv | built from source (LLVM + Clang + libclc); must support `--cl-std=CLC++2021` |
+| ImGui | v1.93.0, vendored in `third_party/imgui/` — nothing to download, only the viewer needs it |
 | Python 3 | optional, only for `scripts/ppm_diff.py` and the OIDN reference scripts |
 
 clspv does not ship with the Vulkan SDK. Build it from
@@ -107,6 +113,47 @@ pwsh -File scripts\compare_smallpt.ps1            # all kernel builds, one table
 module size and device memory; it also diffs the GLSL variants and the two C++/OpenCL variants
 byte by byte. It switches the denoiser off (`SMALLPT_NO_DENOISE=1`) so the comparison is about the
 kernel.
+
+## Interactive viewer
+
+`vk_viewer` is the same renderer with a window you can move the camera in. One command buffer per
+frame: accumulate one jittered path per pixel, resolve into an `R8G8B8A8` image, copy it into a
+sampled image the ImGui backend already knows how to draw, then render the ImGui overlay on top.
+
+| default view, denoised | orbiting |
+| --- | --- |
+| ![](docs/vk_viewer.png) | ![](docs/vk_viewer-orbit.png) |
+
+```powershell
+cmake --build build --config Release --target vk_viewer
+.\build\Release\vk_viewer.exe                                  # window, keeps accumulating
+.\build\Release\vk_viewer.exe --width 900 --height 600 --frames 120 --save renders\view.png
+```
+
+| Input | Action |
+| --- | --- |
+| left drag | orbit (`yaw`/`pitch`, pitch clamped to ±1.45 rad) |
+| right drag | pan the target in the camera plane |
+| wheel | zoom, distance clamped to [6, 900] |
+| `R` / *Reset view* | back to the default camera |
+| `D` / *Denoise* | run the U-Net on what has accumulated (disabled at 0 spp) |
+| `S` / *Save PNG* | write `renders/viewer_<frame>.png` (current working directory if `renders/` is absent) |
+| space / *Accumulate* | pause accumulation without losing the image |
+
+Every camera change resets the sample index to 0: the kernel keeps a running mean, so the image
+refines from scratch instead of averaging two different viewpoints. Denoising leaves the result in
+the accumulation buffer and pauses, so the next drag simply continues from there.
+
+Options: `--frames N` render and exit (used by `scripts/verify_viewer_input.ps1`), `--width` /
+`--height`, `--samples` (cap), `--save <png>` (written on exit), `--denoise` (denoise before the
+final save).
+
+Measured at 1000×700 on the same Intel UHD Graphics: 59 fps, i.e. ~59 spp per second, and the
+denoiser takes 680–730 ms for that resolution (it is 305 ms at 640×480).
+
+Two notes: the window and swapchain are Win32 + `VK_KHR_swapchain` (no GLFW), so CMake only builds
+the target on Windows, and ImGui v1.93.0 is vendored in `third_party/imgui/` with only the core,
+`imgui_impl_win32` and `imgui_impl_vulkan` files (MIT, see `third_party/imgui/LICENSE.txt`).
 
 ## The denoiser
 
@@ -193,6 +240,9 @@ Render + denoise, shipping module (`smallpt.spv`), 640×480 / 64 spp:
 - All eight kernel builds render the same scene; `smallpt_lit.spv` denoises correctly (auxiliary
   images included).
 - `oidn_denoise_tool` on a synthetic 128×96 noisy image: 30-dispatch chain runs, output written.
+- `vk_viewer` on 1000×700: orbit, pan, zoom and `R` behave as described above (driven by
+  `scripts/verify_viewer_input.ps1`, which posts real mouse/keyboard input and captures the
+  window), `D` denoises in ~700 ms, `S` writes a PNG.
 
 Not verified: non-Windows builds, AMD/NVIDIA/Android drivers, 32-bit SPIR-V.
 

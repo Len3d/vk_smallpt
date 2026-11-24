@@ -510,3 +510,79 @@ if(GLSLC_EXECUTABLE AND TARGET smallpt)
 elseif(NOT GLSLC_EXECUTABLE)
   message(WARNING "No glslc, the OIDN denoiser passes cannot be built; smallpt will skip them")
 endif()
+
+# ---------------------------------------------------------------------------
+# Step 10: vk_viewer -- interactive front end: Win32 window, Vulkan swapchain, ImGui overlay and
+# the same clspv-compiled path tracer, accumulating one sample per pixel per frame.
+#
+# src/smallpt_view.cl is plain OpenCL C, so reqd_work_group_size becomes OpExecutionMode LocalSize
+# (no spec constants, no spirv-opt step) and the fast-math flags are the ones measured fastest in
+# Step 6. src/smallpt_view_resolve.cl applies exposure, Reinhard and gamma into a packed RGBA8
+# buffer, which is copied into a sampled image for the ImGui draw list.
+#
+# Dear ImGui is vendored in third_party/imgui (MIT, see third_party/imgui/LICENSE.txt).
+# ---------------------------------------------------------------------------
+if(CLSPV_EXECUTABLE AND WIN32 AND TARGET oidn_shaders)
+  set(VIEW_ACCUM_SPV ${CMAKE_CURRENT_BINARY_DIR}/smallpt_view.spv)
+  set(VIEW_RESOLVE_SPV ${CMAKE_CURRENT_BINARY_DIR}/smallpt_view_resolve.spv)
+
+  add_custom_command(
+    OUTPUT  ${VIEW_ACCUM_SPV}
+    COMMAND ${CLSPV_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/src/smallpt_view.cl
+            -o ${VIEW_ACCUM_SPV} -O3 --use-native-builtins=sin,cos --cl-fast-relaxed-math
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/smallpt_view.cl
+    COMMENT "clspv: src/smallpt_view.cl -> smallpt_view.spv"
+    VERBATIM)
+  add_custom_command(
+    OUTPUT  ${VIEW_RESOLVE_SPV}
+    COMMAND ${CLSPV_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/src/smallpt_view_resolve.cl
+            -o ${VIEW_RESOLVE_SPV} -O3
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/smallpt_view_resolve.cl
+    COMMENT "clspv: src/smallpt_view_resolve.cl -> smallpt_view_resolve.spv"
+    VERBATIM)
+
+  set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui)
+  add_library(imgui STATIC
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp)
+  target_include_directories(imgui PUBLIC ${IMGUI_DIR} ${IMGUI_DIR}/backends)
+  target_link_libraries(imgui PUBLIC Vulkan::Vulkan)
+  if(MSVC)
+    target_compile_options(imgui PRIVATE /W0 /utf-8)
+    target_compile_definitions(imgui PRIVATE _CRT_SECURE_NO_WARNINGS)
+  endif()
+
+  add_executable(vk_viewer src/viewer_main.cpp src/png_writer.cpp src/oidn_denoise.cpp
+                 ${VIEW_ACCUM_SPV} ${VIEW_RESOLVE_SPV})
+  target_link_libraries(vk_viewer PRIVATE Vulkan::Vulkan imgui user32 gdi32)
+  add_dependencies(vk_viewer oidn_shaders)
+
+  file(TO_CMAKE_PATH "${VIEW_ACCUM_SPV}" VIEW_ACCUM_SPV_CMAKE)
+  file(TO_CMAKE_PATH "${VIEW_RESOLVE_SPV}" VIEW_RESOLVE_SPV_CMAKE)
+  target_compile_definitions(vk_viewer PRIVATE
+    SMALLPT_VIEW_ACCUM_SPV="${VIEW_ACCUM_SPV_CMAKE}"
+    SMALLPT_VIEW_RESOLVE_SPV="${VIEW_RESOLVE_SPV_CMAKE}"
+    OIDN_DENOISER_SPV_DIR="${OIDN_SHADER_DIR_CMAKE}"
+    OIDN_DENOISER_WEIGHTS_PATH="${OIDN_WEIGHTS_CMAKE}")
+
+  if(MSVC)
+    target_compile_options(vk_viewer PRIVATE /W4 /utf-8)
+    target_compile_definitions(vk_viewer PRIVATE _CRT_SECURE_NO_WARNINGS)
+  endif()
+  set_property(TARGET vk_viewer PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+
+  target_sources(vk_viewer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/smallpt_view.cl
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/smallpt_view_resolve.cl)
+  set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/smallpt_view.cl
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/smallpt_view_resolve.cl
+    PROPERTIES VS_TOOL_OVERRIDE "None")
+elseif(NOT WIN32)
+  message(STATUS "vk_viewer is Windows-only (Win32 + Vulkan surface), skipped")
+endif()
+
